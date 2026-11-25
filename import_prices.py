@@ -4,6 +4,9 @@ import gzip
 import html
 import json
 import math
+import os
+from zipfile import BadZipFile
+from carrefour_archive import archived_files
 import re
 import time
 from urllib.error import URLError
@@ -50,12 +53,17 @@ def carrefour_directory():
     day = re.search(r"const path = '(\d{8})'", page)[1]
     files = json.JSONDecoder().raw_decode(page.split('const files = ', 1)[1])[0]
     names = [f['name'] for f in files]
+    return carrefour_files(names, lambda name: download(BASE + day + '/' + name))
+
+
+def carrefour_files(names, read):
     root_name = max(n for n in names if re.fullmatch(r'Stores' + CARREFOUR + r'-\d+-\d{8}-\d{6}\.xml', n))
     def price_file(number):
-        names_for_store = [n for n in names if re.fullmatch(rf'PriceFull{CARREFOUR}-\d+-{number:03d}-\d{{8}}-\d{{6}}\.gz', n)]
-        name = max(names_for_store, key=lambda n: n[-18:-3])
-        return name, BASE + day + '/' + name
-    return ET.fromstring(download(BASE + day + '/' + root_name)), price_file
+        matching = [n for n in names if re.fullmatch(rf'PriceFull{CARREFOUR}-\d+-{number:03d}-\d{{8}}-\d{{6}}\.gz', n)]
+        name = max(matching, key=lambda n: n[-18:-3])
+        return name, lambda: read(name)
+    return ET.fromstring(read(root_name)), price_file
+
 
 
 def retail_code(code):
@@ -94,7 +102,7 @@ class IdentityMismatch(ValueError):
 
 
 def price_rows(chain, number, url):
-    root = ET.fromstring(gzip.decompress(download(url)))
+    root = ET.fromstring(gzip.decompress(url() if callable(url) else download(url)))
     if root.findtext('ChainID') != chain or int(root.findtext('StoreID')) != number:
         raise IdentityMismatch('Unexpected price file identity')
     items = {}
@@ -128,7 +136,7 @@ def publish(target=TARGET):
     stores = {}
     problems = []
     checked = datetime.now(TZ).isoformat(timespec='seconds')
-    errors = (URLError, OSError, TimeoutError, EOFError, ValueError, TypeError, KeyError, IndexError, ET.ParseError)
+    errors = (URLError, OSError, TimeoutError, EOFError, ValueError, TypeError, KeyError, IndexError, BadZipFile, ET.ParseError)
     def retain(branch, reason):
         sid = branch['id']
         store = {**old.get(sid, {}), **branch, 'checkedAt': checked}
@@ -140,8 +148,21 @@ def publish(target=TARGET):
 
     for chain, directory in [(CHAIN, shufersal_directory), (CARREFOUR, carrefour_directory)]:
         parent = 'שופרסל' if chain == CHAIN else 'קרפור'
+        source = 'retailer'
         try:
-            root, locate = directory()
+            if chain == CARREFOUR and os.environ.get('GITHUB_ACTIONS') == 'true':
+                try:
+                    names, read = archived_files()
+                    today = datetime.now(TZ).strftime('%Y%m%d')
+                    if not any(n.startswith('Stores') and n[-19:-11] == today for n in names):
+                        raise ValueError('Archive directory is not current')
+                    root, locate = carrefour_files(names, read)
+                    source = 'over.org.il'
+                except errors as exc:
+                    print(f'Archive unavailable ({type(exc).__name__}), checking the retailer')
+                    root, locate = directory()
+            else:
+                root, locate = directory()
             branches = branch_directory(chain, root)
         except errors as exc:
             problems.append(f'{parent} directory ({type(exc).__name__})')
@@ -162,10 +183,10 @@ def publish(target=TARGET):
                 stamp = datetime.strptime(filename[-18:-3], '%Y%m%d-%H%M%S').replace(tzinfo=TZ).isoformat()
                 if stamp < prior.get('verifiedAt', ''):
                     raise ValueError('Older full file')
-                if prior.get('file') != filename or not by_branch.get(sid):
+                if prior.get('file') != filename or prior.get('retrievedFrom') != source or not by_branch.get(sid):
                     by_branch[sid] = price_rows(chain, number, url)
                 stores[sid] = {**branch, 'verifiedAt': stamp, 'file': filename,
-                               'productCount': len(by_branch[sid]), 'checkedAt': checked}
+                               'productCount': len(by_branch[sid]), 'checkedAt': checked, 'retrievedFrom': source}
             except IdentityMismatch:
                 retain(branch, 'מזהה הסניף במחירון שונה מהמזהה במדריך הרשת')
                 if prior.get('verifiedAt'):

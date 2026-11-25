@@ -1,7 +1,7 @@
 name: Ashkelon price refresh
 on:
   schedule:
-    - cron: '17 7 * * *'
+    - cron: '17 9 * * *'
       timezone: Asia/Jerusalem
   workflow_dispatch:
 permissions: {}
@@ -53,3 +53,17 @@ jobs:
       - name: Flag retailers that need another check
         if: needs.refresh.outputs.partial == 'true'
         run: exit 1
+  renew-schedule:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Renew the active schedule at the beginning of each month
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$(TZ=Asia/Jerusalem date +%d)" in
+            01|02) gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/prices.yml/enable" ;;
+          esac
