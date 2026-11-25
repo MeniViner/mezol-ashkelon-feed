@@ -1,0 +1,55 @@
+name: Ashkelon price refresh
+on:
+  schedule:
+    - cron: '17 7 * * *'
+      timezone: Asia/Jerusalem
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: publish-prices
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      partial: ${{ steps.build.outputs.partial }}
+      revision: ${{ steps.build.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: build
+        run: python3 build_feed.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          retention-days: 1
+  publish:
+    needs: refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Check public revision
+        env:
+          EXPECTED: ${{ needs.refresh.outputs.revision }}
+        run: |
+          for try in {1..10}; do
+            actual=$(curl -fsS --max-time 15 "https://meniviner.github.io/mezol-ashkelon-feed/latest.json?run=${GITHUB_RUN_ID}-${try}" | jq -r .sha256) || true
+            if [[ "$actual" == "$EXPECTED" ]]; then exit 0; fi
+            sleep 6
+          done
+          exit 1
+      - name: Flag retailers that need another check
+        if: needs.refresh.outputs.partial == 'true'
+        run: exit 1
