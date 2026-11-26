@@ -1,5 +1,6 @@
-"""Build the list of Ashkelon branches and their packaged product prices."""
+"""Build the list of Ashkelon branches and their package and per-kilogram prices."""
 import argparse
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import gzip
 import html
 import json
@@ -101,15 +102,43 @@ class IdentityMismatch(ValueError):
     pass
 
 
+def weighted_quote(item):
+    """Accept only a full kilogram price with an explicit seller-declared weight basis."""
+    value = lambda field: (item.findtext(field) or '').strip()
+    unit = re.sub(r"[\s\"״'׳.]", '', value('UnitQty')).lower()
+    if value('bIsWeighted').lower() not in ('1', 'true') or unit not in ('קג', 'קילוגרם', 'קילוגרמים', 'kg'):
+        return None
+    try:
+        quantity = Decimal(value('Quantity'))
+        price = Decimal(value('ItemPrice'))
+        if quantity != 1 or not price.is_finite() or price <= 0:
+            return None
+        cents = int((price * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
+    code, name = value('ItemCode'), value('ItemName')
+    if not code.isdigit() or not name or cents < 1:
+        return None
+    return code, [name, 1, 'קילוגרם', value('ManufactureName'), cents, value('PriceUpdateTime')[:10]]
+
+
 def price_rows(chain, number, url):
     root = ET.fromstring(gzip.decompress(url() if callable(url) else download(url)))
     if root.findtext('ChainID') != chain or int(root.findtext('StoreID')) != number:
         raise IdentityMismatch('Unexpected price file identity')
-    items = {}
+    items, weights = {}, {}
     for item in root.iter('Item'):
         def field(key):
             return (item.findtext(key) or '').strip()
         code, title = field('ItemCode'), field('ItemName')
+        if field('bIsWeighted').lower() in ('1','true'):
+            row = weighted_quote(item)
+            if row:
+                key = chain + '-' + row[0]
+                if key in weights:
+                    raise ValueError('Duplicate per-kilogram price')
+                weights[key] = row[1]
+            continue
         if not code.isdigit() or not title or field('bIsWeighted') != '0':
             continue
         price = float(field('ItemPrice'))
@@ -122,16 +151,18 @@ def price_rows(chain, number, url):
                       round(price * 100), field('PriceUpdateTime')[:10]]
     if not items:
         raise ValueError('Empty full price file')
-    return items
+    return items, weights
 
 
 def publish(target=TARGET):
     previous = json.loads(gzip.decompress(target.read_bytes())) if target.exists() else {'stores': [], 'rows': []}
     old = {s['id']: s for s in previous['stores']}
     by_branch = {sid: {} for sid in old}
-    for key, name, qty, unit, maker, quotes in previous['rows']:
-        for sid, price, date in quotes:
-            by_branch[sid][key] = [name, qty, unit, maker, price, date]
+    by_weight = {sid: {} for sid in old}
+    for key_type, destination in [('rows', by_branch), ('weights', by_weight)]:
+        for key, name, qty, unit, maker, quotes in previous.get(key_type, []):
+            for sid, price, date, *label in quotes:
+                destination[sid][key] = [label[0] if label else name, qty, unit, maker, price, date]
 
     stores = {}
     problems = []
@@ -183,10 +214,10 @@ def publish(target=TARGET):
                 stamp = datetime.strptime(filename[-18:-3], '%Y%m%d-%H%M%S').replace(tzinfo=TZ).isoformat()
                 if stamp < prior.get('verifiedAt', ''):
                     raise ValueError('Older full file')
-                if prior.get('file') != filename or prior.get('retrievedFrom') != source or not by_branch.get(sid):
-                    by_branch[sid] = price_rows(chain, number, url)
+                if prior.get('file') != filename or prior.get('retrievedFrom') != source or not by_branch.get(sid) or 'weightCount' not in prior:
+                    by_branch[sid], by_weight[sid] = price_rows(chain, number, url)
                 stores[sid] = {**branch, 'verifiedAt': stamp, 'file': filename,
-                               'productCount': len(by_branch[sid]), 'checkedAt': checked, 'retrievedFrom': source}
+                               'productCount': len(by_branch[sid]), 'weightCount': len(by_weight[sid]), 'checkedAt': checked, 'retrievedFrom': source}
             except IdentityMismatch:
                 retain(branch, 'מזהה הסניף במחירון שונה מהמזהה במדריך הרשת')
                 if prior.get('verifiedAt'):
@@ -196,14 +227,20 @@ def publish(target=TARGET):
                 problems.append(f'{sid} ({type(exc).__name__})')
     if {s['parent'] for s in stores.values() if s.get('verifiedAt')} != {'שופרסל', 'קרפור'}:
         raise ValueError('No usable baseline for both retailers')
-    rows = {}
-    for sid, store in stores.items():
-        if not store.get('verifiedAt'):
-            continue
-        for key, (title, qty, unit, maker, price, date) in by_branch[sid].items():
-            row = rows.setdefault(key, [key, title, qty, unit, maker, []])
-            row[-1].append([sid, price, date])
-    payload = dict(stores=list(stores.values()), rows=list(rows.values()))
+    def compact(tables, include_label):
+        rows = {}
+        for sid, store in stores.items():
+            if not store.get('verifiedAt'):
+                continue
+            for key, (title, qty, unit, maker, price, date) in tables.get(sid, {}).items():
+                row = rows.setdefault(key, [key, title, qty, unit, maker, []])
+                quote = [sid, price, date]
+                if include_label and title != row[1]:
+                    quote.append(title)
+                row[-1].append(quote)
+        return list(rows.values())
+    rows = compact(by_branch, False)
+    payload = dict(stores=list(stores.values()), rows=rows, weights=compact(by_weight, True))
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
     target.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(dir=target.parent, delete=False) as output:
