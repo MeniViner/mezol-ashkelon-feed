@@ -23,6 +23,8 @@ jobs:
           persist-credentials: false
       - id: build
         run: python3 build_feed.py
+      - name: Refresh national directory and fallback prices
+        run: python3 national_feed.py
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
