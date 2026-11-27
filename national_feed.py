@@ -56,14 +56,27 @@ def write(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
 
 
-def build(out):
-    out.mkdir(exist_ok=True, parents=True)
+def build_directory(out):
     directory = {}
     columns = "chain,sub_chain_id,store_id,chain_name,store_name,address,city,city_code,store_type"
-    for row in pages("prices_stores", order="chain,sub_chain_id,store_id", columns=columns):
-        if not row["city"] or not re.search("[א-תa-zA-Z]", row["city"]):
-            continue
-        directory[key(row)] = [row[k] or "" for k in columns.split(",")[3:]] + ["", ""]
+    entries = list(pages("prices_stores", order="chain,sub_chain_id,store_id", columns=columns))
+    cities = {r["city"] for r in entries if r["city_code"] and r["city"] and re.search("[א-ת]",r["city"])}
+    def words(value):
+        return " ".join(re.findall(r"[א-תa-z0-9]+", (value or "").lower()))
+    aliases = {words(c): c for c in cities}
+    for city in cities:
+        if words(city) == "תל אביב יפו":
+            aliases["תל אביב"] = city
+    for row in entries:
+        store = [row[k] or "" for k in columns.split(",")[3:]]
+        inferred = False
+        if not store[3] or not re.search("[א-תa-zA-Z]",store[3]):
+            label = " " + words(store[1]) + " "
+            matches = {city for alias,city in aliases.items() if len(alias) >= 3 and
+                       (" " + alias + " ") in label}
+            store[3] = matches.pop() if len(matches) == 1 else "ללא עיר מזוהה"
+            inferred = store[3] != "ללא עיר מזוהה"
+        directory[key(row)] = store + ["", "", inferred]
     if len(directory) < 500:
         raise RuntimeError("Incomplete national branch directory")
     # The newest coverage row can contain a promo file alone. Only attach actual price files.
@@ -76,11 +89,17 @@ def build(out):
         store = directory.get(key(row))
         filename = row["price_file"] or ""
         match = re.search(r"PriceFull(\d{13})-", filename, re.I)
-        if store and not store[-1] and match and (row["price_items"] or 0) > 0:
-            store[-2:] = [row["price_file_time"], match[1]]
+        if store and not store[7] and match and (row["price_items"] or 0) > 0:
+            store[6:8] = [row["price_file_time"], match[1]]
     write(out / "national-directory.json", {"day": DAY, "stores": directory})
     print("National directory:", len(directory), flush=True)
 
+    return directory
+
+
+def build(out):
+    out.mkdir(exist_ok=True, parents=True)
+    directory = build_directory(out)
     backup = defaultdict(dict)
     products = {}
     for code in CODES:
@@ -98,8 +117,8 @@ def build(out):
     # chain/store numbers AND an identical nonempty street address.
     by_address = defaultdict(list)
     for sid, store in directory.items():
-        if store[-1] and text(store[2]):
-            by_address[(store[-1], int(sid.split("|")[2]), text(store[2]))].append(sid)
+        if store[7] and text(store[2]) and sid.split("|")[2].isdigit():
+            by_address[(store[7], int(sid.split("|")[2]), text(store[2]))].append(sid)
     priceil_ids = {}
     def priceil(path):
         time.sleep(3.2)  # anonymous public allowance is 20 requests per minute
